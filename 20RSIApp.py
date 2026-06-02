@@ -1,35 +1,68 @@
 import streamlit as st
 import pandas as pd
 import requests
-from ta.momentum import RSIIndicator
 import time
+
+# -----------------------------
+# PAGE CONFIG
+# -----------------------------
+st.set_page_config(
+    page_title="Crypto RSI Scanner",
+    layout="wide"
+)
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 COINGECKO_API = "https://api.coingecko.com/api/v3"
-MARKET_CAP_THRESHOLD = 1_000_000_000  # $1 Billion
-RSI_PERIOD = 14
+
+st.sidebar.header("Scanner Settings")
+
 RSI_VALUE = st.sidebar.number_input(
-    "Minimum RSI Value",
+    "Minimum RSI",
     min_value=0.0,
     max_value=100.0,
-    value=20.0,
+    value=30.0,
     step=1.0
 )
 
-st.set_page_config(page_title="Crypto RSI Scanner", layout="wide")
+MARKET_CAP_THRESHOLD = (
+    st.sidebar.number_input(
+        "Minimum Market Cap (Million USD)",
+        min_value=0,
+        value=1000,  # 1000M = 1B
+        step=100
+    )
+    * 1_000_000
+)
+
+MAX_COINS = st.sidebar.number_input(
+    "Coins To Scan",
+    min_value=10,
+    max_value=250,
+    value=100,
+    step=10
+    )
 
 st.title("🚀 Crypto RSI Scanner")
+
 st.write(
-    "Filters coins with Market Cap > $1B and RSI > 20 on 15m, 4h and 1D timeframes."
+    f"""
+    Scans top crypto assets and filters coins where:
+    
+    - RSI(15m) > {RSI_VALUE}
+    - RSI(4H) > {RSI_VALUE}
+    - RSI(1D) > {RSI_VALUE}
+    - Market Cap > ${MARKET_CAP_THRESHOLD / 1_000_000:,.0f}M
+    """
 )
 
 # -----------------------------
-# FUNCTIONS
+# COINGECKO COINS
 # -----------------------------
 @st.cache_data(ttl=300)
 def get_top_coins():
+
     url = (
         f"{COINGECKO_API}/coins/markets"
         "?vs_currency=usd"
@@ -39,62 +72,97 @@ def get_top_coins():
         "&sparkline=false"
     )
 
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
 
     df = pd.DataFrame(response.json())
 
-    return df[df["market_cap"] > MARKET_CAP_THRESHOLD]
+    df = df[df["market_cap"] >= MARKET_CAP_THRESHOLD]
+
+    return df.head(MAX_COINS)
 
 
-def calculate_rsi(prices, period=14):
-    df = pd.DataFrame(prices, columns=["timestamp", "price"])
+# -----------------------------
+# RSI CALCULATION
+# -----------------------------
+def calculate_rsi(closes, period=14):
 
-    rsi = RSIIndicator(
-        close=df["price"],
-        window=period
-    ).rsi()
+    series = pd.Series(closes)
 
-    return float(rsi.iloc[-1])
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss
+
+    rsi = 100 - (100 / (1 + rs))
+
+    return round(float(rsi.iloc[-1]), 2)
 
 
-def get_market_chart(coin_id, days):
-    """
-    CoinGecko provides historical prices.
-    We use:
-      1 day  -> approximate 15m RSI
-      7 days -> approximate 4h RSI
-      90 days -> daily RSI
-    """
+# -----------------------------
+# BINANCE KLINES
+# -----------------------------
+def get_binance_klines(symbol, interval, limit=200):
 
-    url = (
-        f"{COINGECKO_API}/coins/{coin_id}/market_chart"
-        f"?vs_currency=usd&days={days}"
+    url = "https://data-api.binance.vision/api/v3/klines"
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=20
     )
 
-    response = requests.get(url)
     response.raise_for_status()
 
-    return response.json()["prices"]
+    data = response.json()
+
+    closes = [float(candle[4]) for candle in data]
+
+    return closes
 
 
-def get_coin_rsi(coin_id):
+# -----------------------------
+# RSI FOR COIN
+# -----------------------------
+def get_coin_rsi(binance_symbol):
+
     try:
-        # Approximation because CoinGecko doesn't provide
-        # direct 15m and 4h candles in free API.
 
-        prices_15m = get_market_chart(coin_id, 1)
-        prices_4h = get_market_chart(coin_id, 7)
-        prices_1d = get_market_chart(coin_id, 90)
+        closes_15m = get_binance_klines(
+            binance_symbol,
+            "15m"
+        )
 
-        rsi_15m = calculate_rsi(prices_15m)
-        rsi_4h = calculate_rsi(prices_4h)
-        rsi_1d = calculate_rsi(prices_1d)
+        closes_4h = get_binance_klines(
+            binance_symbol,
+            "4h"
+        )
+
+        closes_1d = get_binance_klines(
+            binance_symbol,
+            "1d"
+        )
+
+        rsi_15m = calculate_rsi(closes_15m)
+        rsi_4h = calculate_rsi(closes_4h)
+        rsi_1d = calculate_rsi(closes_1d)
 
         return rsi_15m, rsi_4h, rsi_1d
 
-    except Exception:
-        return None, None, None
+    except Exception as e:
+         st.write(f"{binance_symbol}: {str(e)}")
+         return None, None, None
 
 
 # -----------------------------
@@ -102,57 +170,107 @@ def get_coin_rsi(coin_id):
 # -----------------------------
 if st.button("Scan Coins"):
 
-    progress = st.progress(0)
-
-    st.info("Fetching large-cap coins...")
+    st.info("Fetching coins...")
 
     coins = get_top_coins()
 
     results = []
 
+    success_count = 0
+    fail_count = 0
+
     total = len(coins)
 
-    for idx, row in enumerate(coins.iterrows()):
+    progress = st.progress(0)
 
-        _, coin = row
+    SKIP_SYMBOLS = [
+        "USDT",
+        "USDC",
+        "DAI",
+        "FDUSD",
+        "TUSD"
+    ]
 
-        coin_id = coin["id"]
+    
+    for idx, (_, coin) in enumerate(coins.iterrows()):
+
         symbol = coin["symbol"].upper()
 
-        rsi_15m, rsi_4h, rsi_1d = get_coin_rsi(coin_id)
+        if symbol in SKIP_SYMBOLS:
+            continue
+
+        # Binance pair
+        binance_symbol = f"{symbol}USDT"
+       # st.write(f"Testing: {binance_symbol}")  ##for testing which all coins are getting called 
+        rsi_15m, rsi_4h, rsi_1d = get_coin_rsi(
+            binance_symbol
+        )
+
+        if rsi_15m is None:
+
+            fail_count += 1
+
+            progress.progress((idx + 1) / total)
+
+            continue
+
+        success_count += 1
 
         if (
-            rsi_15m is not None
-            and rsi_4h is not None
-            and rsi_1d is not None
-            and rsi_15m > RSI_VALUE
+            rsi_15m > RSI_VALUE
             and rsi_4h > RSI_VALUE
             and rsi_1d > RSI_VALUE
         ):
+
             results.append(
                 {
                     "Rank": coin["market_cap_rank"],
                     "Coin": symbol,
                     "Name": coin["name"],
-                    "Market Cap (M$)": f"{coin['market_cap'] / 1_000_000:,.2f} M",
-                    "RSI 15m": round(rsi_15m, 2),
-                    "RSI 4H": round(rsi_4h, 2),
-                    "RSI 1D": round(rsi_1d, 2),
+                    "Market Cap (M$)": round(
+                        coin["market_cap"] / 1_000_000,
+                        2
+                    ),
+                    "RSI 15m": rsi_15m,
+                    "RSI 4H": rsi_4h,
+                    "RSI 1D": rsi_1d,
                 }
             )
 
         progress.progress((idx + 1) / total)
 
-        # Avoid API rate limits
-        time.sleep(0.2)
+        # Small pause
+        time.sleep(0.05)
 
-    st.success(f"Found {len(results)} matching coins")
+    st.success(
+        f"Found {len(results)} matching coins"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.metric(
+            "Successful RSI Calculations",
+            success_count
+        )
+
+    with col2:
+        st.metric(
+            "Failed Coins",
+            fail_count
+        )
 
     if results:
+
         df = pd.DataFrame(results)
 
+        df = df.sort_values(
+            "Rank",
+            ascending=True
+        )
+
         st.dataframe(
-            df.sort_values("Rank", ascending=True),
+            df,
             use_container_width=True
         )
 
@@ -164,5 +282,9 @@ if st.button("Scan Coins"):
             "crypto_rsi_scan.csv",
             "text/csv"
         )
+
     else:
-        st.warning("No coins matched the criteria.")
+
+        st.warning(
+            "No coins matched the criteria."
+        )
