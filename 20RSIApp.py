@@ -81,7 +81,83 @@ def get_top_coins():
 
     return df.head(MAX_COINS)
 
+#---------------------------
+#gecko market source
+#----------------------------
+@st.cache_data(ttl=3600)
+def get_market_chart(coin_id, days):
 
+    url = (
+        f"{COINGECKO_API}/coins/{coin_id}/market_chart"
+        f"?vs_currency=usd&days={days}"
+    )
+
+    for attempt in range(5):
+
+        response = requests.get(url, timeout=20)
+
+        if response.status_code == 429:
+            time.sleep(15)
+            continue
+
+        response.raise_for_status()
+
+        return response.json()["prices"]
+
+    raise Exception(
+        f"CoinGecko rate limit exceeded for {coin_id}"
+    )
+
+    url = (
+        f"{COINGECKO_API}/coins/{coin_id}/market_chart"
+        f"?vs_currency=usd&days={days}"
+    )
+
+    for attempt in range(3):
+
+        response = requests.get(url, timeout=20)
+
+        if response.status_code == 429:
+
+            time.sleep(10)   # wait and retry
+            continue
+
+        response.raise_for_status()
+
+        return response.json()["prices"]
+
+    raise Exception(
+        f"CoinGecko rate limit exceeded for {coin_id}"
+    )
+
+    url = (
+        f"{COINGECKO_API}/coins/{coin_id}/market_chart"
+        f"?vs_currency=usd&days={days}"
+    )
+
+    response = requests.get(url, timeout=20)
+
+    response.raise_for_status()
+
+    return response.json()["prices"]
+#------------------------------
+# gecko source
+#--------------------------------
+def get_coingecko_rsi(coin_id):
+
+    prices_15m = get_market_chart(coin_id, 1)
+    prices_4h = get_market_chart(coin_id, 7)
+    prices_1d = get_market_chart(coin_id, 90)
+
+    closes_15m = [x[1] for x in prices_15m]
+    closes_4h = [x[1] for x in prices_4h]
+    closes_1d = [x[1] for x in prices_1d]
+
+    return (
+        calculate_rsi(closes_15m),
+        calculate_rsi(closes_4h),
+        calculate_rsi(closes_1d)
+    )
 # -----------------------------
 # RSI CALCULATION
 # -----------------------------
@@ -136,6 +212,27 @@ def get_binance_klines(symbol, interval, limit=200):
 # RSI FOR COIN
 # -----------------------------
 def get_coin_rsi(binance_symbol):
+
+    closes_15m = get_binance_klines(
+        binance_symbol,
+        "15m"
+    )
+
+    closes_4h = get_binance_klines(
+        binance_symbol,
+        "4h"
+    )
+
+    closes_1d = get_binance_klines(
+        binance_symbol,
+        "1d"
+    )
+
+    rsi_15m = calculate_rsi(closes_15m)
+    rsi_4h = calculate_rsi(closes_4h)
+    rsi_1d = calculate_rsi(closes_1d)
+
+    return rsi_15m, rsi_4h, rsi_1d
 
     try:
 
@@ -202,10 +299,37 @@ if st.button("Scan Coins"):
         # Binance pair
         binance_symbol = f"{symbol}USDT"
        # st.write(f"Testing: {binance_symbol}")  ##for testing which all coins are getting called 
-        rsi_15m, rsi_4h, rsi_1d = get_coin_rsi(
-            binance_symbol
-        )
-
+        try:
+            rsi_15m, rsi_4h, rsi_1d = get_coin_rsi(
+                binance_symbol
+            )
+            source = "Binance"
+        except Exception as binance_error:
+        
+         
+            try:
+                time.sleep(1)   # avoid CoinGecko throttling
+                rsi_15m, rsi_4h, rsi_1d = get_coingecko_rsi(
+                    coin["id"]
+                )
+        
+                source = "CoinGecko"
+        
+#                st.success(
+#                    f"{symbol}: CoinGecko fallback worked"
+#                )
+        
+            except Exception as gecko_error:
+        
+                st.error(
+                    f"{symbol}: CoinGecko failed -> {gecko_error}"
+                )
+        
+                fail_count += 1
+                continue
+             
+                fail_count += 1
+                continue
         if rsi_15m is None:
 
             fail_count += 1
@@ -227,6 +351,7 @@ if st.button("Scan Coins"):
                     "Rank": coin["market_cap_rank"],
                     "Coin": symbol,
                     "Name": coin["name"],
+                    "Source": source,
                     "Market Cap (M$)": round(
                         coin["market_cap"] / 1_000_000,
                         2
